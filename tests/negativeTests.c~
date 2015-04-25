@@ -1,0 +1,38 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include <err.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+int main(){
+	int fd;
+	char buf[100];
+	printf("----Opening a file does not exist-----\n");
+	fd = open("test",O_RDONLY);
+	if (fd < 0)
+		printf("File does not exist %d", fd);
+	
+	printf("----Opening a directory----\n");
+	fd = open("../include/",O_RDONLY);
+	if (fd < 0)
+		printf("Is a directory %d\n", fd);
+	else
+		close(fd);
+		
+	printf("----Opening a file----\n");
+	fd = open("open_create.txt",O_RDONLY);
+	if (fd < 0)
+		printf("Is a directory %d\n", fd);
+	else
+		printf("File descriptor %d\n", fd);
+	
+	read(fd,buf,10);
+	close(fd);
+	
+	fd = unlink("../delete/");
+	if (fd<0)
+		printf("Is a directory %d\n", fd);
+	
+}

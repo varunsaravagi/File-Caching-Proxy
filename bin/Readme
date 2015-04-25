@@ -1,0 +1,12 @@
+/********** README ***********/
+/*Varun Saravagi*/
+
+The folder contains the following files:
+
+1. 	Proxy.java			: 	Class to handle the proxy
+2.	Server.java			:	Class to handle the server. Implements 		
+							RmiInterface.java
+3.	RmiInterface.java	:	Interface for the Server class
+4.	FileCache.java		:	Class to handle the file in the cache
+5.	CacheMgr.java		: 	Class to manage the cache
+6.	writeup_vsaravag	: 	Design writeup

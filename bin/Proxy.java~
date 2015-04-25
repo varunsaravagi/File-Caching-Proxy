@@ -1,0 +1,905 @@
+/* Sample skeleton for proxy */
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.net.MalformedURLException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.NonWritableChannelException;
+import java.nio.channels.OverlappingFileLockException;
+import java.rmi.Naming;
+import java.rmi.NotBoundException;
+import java.rmi.RemoteException;
+import java.util.ArrayList;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
+class Proxy {
+
+	// Variables at the proxy level.
+	private static RmiInterface svr = null;
+	private static String dir = null;
+	private static long dir_size = 0;
+	private static CacheMgr cacheMgr = new CacheMgr();
+
+	// Maximum file size which can be transferred/received at a time
+	private static final int MAX_BLOCK_SIZE = 1024 * 1024;
+	// Unique ID for the proxy
+	private static UUID PROXY_ID = null;
+	// object to maintain locking
+	private static Object lock = new Object();
+
+	public static class FileHandler implements FileHandling {
+
+		/*----- The static variables are meant to be shared across all the clients-----*/
+
+		// File descriptor to be given to each client. Has to be unique across clients.
+		private static int uniqueFd = 10;
+
+		// Map to store the File Descriptor against the associated FileCache object
+		private static ConcurrentHashMap<Integer, FileCache> fileCacheFdMap = new ConcurrentHashMap<Integer, FileCache>();
+		
+		// Map to associate the private copies with the master copy
+		private static ConcurrentHashMap<String, String> privateHasMasterCopyMap = new ConcurrentHashMap<String, String>();
+		
+		/*----- The below variables are private to a client and not shared among different clients -----*/
+
+		// Map to store the RandomFileAccess object against the File Descriptor
+		private ConcurrentHashMap<Integer, RandomAccessFile> fileFdMap = new ConcurrentHashMap<Integer, RandomAccessFile>();
+		
+		// ArrayList to store the File Descriptors which are opened for a directory
+		private ArrayList<Integer> fdDir = new ArrayList<Integer>();
+		
+
+		// ByteBuffer to wrap the content of the Byte[]
+		private ByteBuffer content;
+
+		// TODO change this description
+		/*
+		 * (non-Javadoc)
+		 * 
+		 * @see FileHandling#open(java.lang.String, FileHandling.OpenOption)
+		 * 
+		 * 1. Check if the file is in cache or not. If not in cache or if the
+		 * version is stale, get the fresh file from server and store in cache.
+		 * Update the version number to what is given by server. 2. Open the
+		 * file from the cache. -- The file descriptor along with the File
+		 * object is placed on the hashmap so that the same file object can be
+		 * accessed for subsequent operations. -- Record the mode in which the
+		 * file descriptor returned is opened
+		 */
+		public int open(String path, OpenOption o) {
+
+			String mode = o.toString();
+			System.err.format("Proxy: %s (thread %d): In Open (%s)-> %s\n",
+					PROXY_ID.toString(), Thread.currentThread().getId(), mode,
+					path);
+
+			// Get the instance of FileCache object
+			FileCache file = new FileCache(path, createSessionId(path), dir,
+					o.toString());
+
+			// The file needs to be checked with the server.
+			// Open a session on the server for the file and get the required
+			// attributes
+			try {
+				file = svr.openSession(file);
+			} catch (RemoteException e) {
+				System.err.println("Unable to connect to remote function\n "
+						+ e);
+				return Errors.EBUSY; // TODO Find suitable error
+			}
+
+			// Check for negative session id. A negative session id indicates
+			// some error on server side.
+			try {
+				if (Integer.parseInt(file.getSessionId()) == Errors.EBADF) {
+					System.err
+							.format("Proxy: %s (thread %d): File %s (%s). Does not exist on server\n",
+									PROXY_ID.toString(), Thread.currentThread()
+											.getId(), path, mode);
+					return Errors.EBADF;
+				}
+				
+				// If the file is opened in CREATE_NEW mode, file should not
+				// exist on the server.
+				if (Integer.parseInt(file.getSessionId()) == Errors.EEXIST) {
+					System.err
+							.format("Proxy: %s (thread %d): File %s (%s). Exists on server\n",
+									PROXY_ID.toString(), Thread.currentThread()
+											.getId(), path, mode);
+					return Errors.EEXIST;
+				}
+				
+				// File should not be accessed outside the server directory
+				if (Integer.parseInt(file.getSessionId()) == Errors.EPERM) {
+					System.err
+							.format("Proxy: %s (thread %d): File %s (%s). Outside server directory\n",
+									PROXY_ID.toString(), Thread.currentThread()
+											.getId(), path, mode);
+					return Errors.EPERM;
+				}
+			} catch (NumberFormatException e) {
+					System.err
+							.format("Proxy: %s (thread %d): File %s (%s). Error in session id parsing\n",
+									PROXY_ID.toString(), Thread.currentThread()
+											.getId(), path, mode);
+			}
+
+			// If the file being requested is a directory and is opened in READ
+			// mode, return a file descriptor.
+			// Since we are not considering directory contents for the project,
+			// I have decided not to create the directory in the cache.
+
+			if (file.isDir() && mode.compareTo("READ") == 0) {
+				System.err
+						.format("Proxy: %s (thread %d): File %s (%s). Is a directory\n",
+								PROXY_ID.toString(), Thread.currentThread()
+										.getId(), path, mode);
+				// Since file descriptor variable is shared across clients, the
+				// operation needs to be made atomic
+				// so as to make sure that the fd generated for the file is the
+				// one which is added to the list and
+				// returned.
+				synchronized (lock) {
+					uniqueFd++;
+					fdDir.add(uniqueFd);
+					return uniqueFd;
+				}
+			} else if (file.isDir()) {
+				// directory is requested to be opened in NON-READ mode, return
+				// error
+				System.err
+						.format("Proxy: %s (thread %d): File %s (%s). Is a directory opened in NON-READ\n",
+								PROXY_ID.toString(), Thread.currentThread()
+										.getId(), path, mode);
+				return Errors.EISDIR;
+			}
+
+			/*
+			 * Get exclusive lock on the file before comparing the file in cache
+			 * to the file on server This is to make sure that no two clients on
+			 * a Proxy are fetching the same file from the server
+			 * simultaneously.
+			 */
+			File f = new File(createPathName(dir, file.getFilePath()));
+			RandomAccessFile rf = null;
+			FileLock fLock = null;
+			try {
+				// If the code comes here and the file is to be opened in
+				// CREATE_NEW,
+				// we can create the file while getting the lock itself.
+				rf = new RandomAccessFile(f, "rw");
+				FileChannel fChannel = rf.getChannel();
+
+				// Loop till the client gets a lock on the file.
+				// If the client does not get a lock, it means that another
+				// client is currently getting the same file
+				// from the server.
+				// Note: We do not want two clients to get the same file
+				// simultaneously from the server.
+				while (true) {
+					try {
+						fLock = fChannel.tryLock();
+						break;
+					} catch (OverlappingFileLockException e) {
+					}
+				}
+
+			} catch (FileNotFoundException e) {
+				// This exception would never be raised. File has been created
+				// already.
+			} catch (IOException e) {
+				System.err
+						.format("Proxy: %s (thread %d): File %s (%s). Error creating lock\n",
+								PROXY_ID.toString(), Thread.currentThread()
+										.getId(), path, mode);
+				return -1;
+			}
+
+			/*
+			 * At this point, the client has obtained a lock on the file. It can
+			 * now see whether it needs to fetch the file or not.
+			 * ----------------
+			 * -------------------------------------------------------- If the
+			 * file exists on the cache but is not the latest version OR the
+			 * file does not exist on the cache, in both the cases, fetch the
+			 * file from the server.
+			 */
+			FileCache cachedFile = null;
+			boolean getFromServer = false;
+			// Check if the file exists in cache or not
+			if ((cachedFile = cacheMgr.isFileInCache(path)) != null) {
+				// File exists in cache.
+				// Compare the last modified date of the file in cache with the
+				// last modified date of the
+				// file on server (file object's last modified date)
+				if (cachedFile.getLastModifiedAt() != file.getLastModifiedAt())
+					// File in cache is not the latest version.
+					getFromServer = true;
+				else
+					file = cachedFile;
+			} else
+				// File does not exist in the cache.
+				getFromServer = true;
+
+			if (getFromServer) {
+				System.err
+						.format("Proxy: %s (thread %d): File %s. Getting from server\n",
+								PROXY_ID.toString(), Thread.currentThread()
+										.getId(), path);
+				int nrOfBlocks = file.getNrOfBlocks();
+				if (nrOfBlocks == 0) {
+					// New file is to be created.
+					// It has already been created while acquiring lock.
+					// Since it's a new file, it would not take any space in the
+					// cache till it is written to.
+				} else {
+					// Check cache for space.
+					// This process needs to be synchronized so that multiple
+					// clients don't update
+					// the cache space simultaneously
+					synchronized (lock) {
+						// If the file is in use currently by another client for
+						// read purpose,
+						// create a separate copy in cache.
+
+						boolean hasSpace = cacheMgr.checkAndMakeSpace(
+								file.getFileSize(), path, path, false);
+						// Cache does not have space.
+						if (!hasSpace) {
+							System.err
+									.format("Proxy: %s (thread %d): File %s. Cache does not have space\n",
+											PROXY_ID.toString(), Thread
+													.currentThread().getId(),
+											path);
+							// release the lock on the file
+							try {
+								boolean deleted = f.delete(); // the file was
+																// created while
+																// getting lock.
+																// Delete it.
+								System.err
+										.format("Proxy: %s (thread %d): File %s. Deleted %s\n",
+												PROXY_ID.toString(), Thread
+														.currentThread()
+														.getId(), path, deleted);
+								fLock.release();
+								rf.close();
+							} catch (IOException e) {
+								System.err
+										.format("Proxy: %s (thread %d): File %s. Error releasing lock\n",
+												PROXY_ID.toString(), Thread
+														.currentThread()
+														.getId(), path);
+							}
+							// Close session
+							try {
+								svr.closeSession(privateHasMasterCopyMap.get(file.getFilePath()));
+							} catch (RemoteException e) {
+								System.err
+										.format("Proxy: %s (thread %d): File %s. Unable to connect to remote function\n",
+												PROXY_ID.toString(), Thread
+														.currentThread()
+														.getId(), path);
+							}
+							return Errors.ENOMEM;
+						}
+						
+						try {
+							String newName = path;
+							if (cacheMgr.fileInUse(path)) {
+								System.err
+								.format("Proxy: %s (thread %d): File %s is being used by other client. Creating another copy\n ",
+										PROXY_ID.toString(), Thread
+										.currentThread().getId(),
+										path);
+								newName = createNewName(path, "r");
+								f = new File(createPathName(dir, newName));
+							}
+							else
+							{
+								f = new File(createPathName(dir, path));
+								f.delete();
+							}
+							// Get the file in blocks
+							for (int i = 1; i <= nrOfBlocks; i++) {
+								byte[] bytes;
+								bytes = svr.getFile(i, file);
+								FileOutputStream fOut = new FileOutputStream(f,
+										true);
+								fOut.write(bytes);
+								fOut.close();
+							}
+							file.setFilePath(newName);
+							// set the latest version of the file in cache
+							cacheMgr.setLatestVersion(path, file);
+							privateHasMasterCopyMap.put(newName, path);
+
+						} catch (RemoteException e) {
+							System.err.println("Error creating remote connection "
+									+ e);
+						} catch (FileNotFoundException e) {
+							// This exception would never be raised
+						} catch (IOException e) {
+							System.err.println("Error writing file " + e);
+							// TODO return appropriate error
+						}
+					}
+				}
+			} else {
+				System.err
+						.format("Proxy: %s (thread %d): File %s.Getting file from cache\n ",
+								PROXY_ID.toString(), Thread.currentThread()
+										.getId(), path);
+			}
+
+			// release the lock on the file
+			try {
+				fLock.release();
+				rf.close();
+			} catch (IOException e) {
+				System.err.println("Error releasing lock " + e);
+			}
+			// Close session
+			try {
+				svr.closeSession(privateHasMasterCopyMap.get(file.getFilePath()));
+			} catch (RemoteException e) {
+				System.err.println("Unable to connect to remote function " + e);
+			}
+
+			// Open the file now.
+
+			try {
+				// check whether the Option sent is in the enum or not.
+				OpenOption.valueOf(mode);
+
+				rf = null;
+				if (mode.compareTo("CREATE_NEW") == 0
+						|| mode.compareTo("CREATE") == 0
+						|| mode.compareTo("WRITE") == 0) {
+
+					// create a private copy here and open that
+					String privateFileName = createNewName(file.getFilePath(), "w");
+					System.err
+					.format("Proxy: %s (thread %d): File %s. Creating private copy\n ",
+							PROXY_ID.toString(), Thread
+									.currentThread().getId(), path);
+					
+					synchronized (lock) {
+
+						// Check if the cache has space for the private copy.
+						boolean hasSpace = cacheMgr.checkAndMakeSpace(
+								file.getFileSize(), path, privateFileName, true);
+						if (!hasSpace) {
+							System.err
+							.format("Proxy: %s (thread %d): File %s. Not enough space to create private copy\n ",
+									PROXY_ID.toString(), Thread
+									.currentThread().getId(), path);
+							return Errors.ENOMEM;
+						}
+						try {
+							File sFile = new File(createPathName(dir, path));
+							File dFile = new File(createPathName(dir,
+									privateFileName));
+							dFile.createNewFile();
+							
+							cacheMgr.createPrivateCopy(sFile, dFile);
+							FileCache masterFile = (FileCache) file.clone();
+							cacheMgr.markFileAsMRU(masterFile);
+							
+							privateHasMasterCopyMap.put(privateFileName, path);
+							rf = new RandomAccessFile(createPathName(dir,
+									privateFileName), "rw");
+							
+							// update the file object to have the new path
+							file.setFilePath(privateFileName);
+						} catch (IOException e) {
+							System.err
+							.format("Proxy: %s (thread %d): File %s. Failed to create private copy\n ",
+									PROXY_ID.toString(), Thread
+									.currentThread().getId(), path);
+							// TODO find proper error to return
+						} catch (CloneNotSupportedException e) {
+							// TODO Auto-generated catch block
+							e.printStackTrace();
+						}
+					}
+				} else {
+					// open file only for read only access
+					rf = new RandomAccessFile(createPathName(dir, path), "r");
+				}
+
+				// This ensures that the generated fd is only returned as ++ is
+				// not an atomic operation
+				synchronized (lock) {
+					uniqueFd++;
+					return setMaps(uniqueFd, file, rf);
+				}
+			} catch (FileNotFoundException e) {
+				System.out.format("Does not exists %d\n", Errors.ENOENT);
+				return Errors.ENOENT;
+			} catch (IllegalArgumentException e) {
+				System.out.format("Invalid parameter %d\n", Errors.EINVAL);
+				return Errors.EINVAL;
+			}
+			/*
+			 * try { Thread.sleep(5000); } catch (InterruptedException e) { //
+			 * TODO Auto-generated catch block e.printStackTrace(); }
+			 */
+		}
+
+		public int close(int fd) {
+			System.err.format("Proxy: %s (thread %d): In Close (Fd: %d, file: %s, mode: %s)\n",
+					PROXY_ID.toString(), Thread.currentThread().getId(), fd, fileCacheFdMap.get(fd).getFilePath(), fileCacheFdMap.get(fd).getFileMode());
+			if (fdDir.contains(fd)) {
+				System.err
+						.format("Proxy: %s (thread %d): In Close (Fd: %d). Closing directory\n",
+								PROXY_ID.toString(), Thread.currentThread()
+										.getId(), fd);
+				fdDir.remove(fdDir.indexOf(fd));
+				return 0;
+			}
+
+			if (!fileFdMap.containsKey(fd)) {
+				System.err
+						.format("Proxy: %s (thread %d): In Close (Fd: %d). Does not contain Fd\n",
+								PROXY_ID.toString(), Thread.currentThread()
+										.getId(), fd);
+				return Errors.EBADF;
+			}
+
+			FileCache file = fileCacheFdMap.get(fd);
+			String fileName = file.getFilePath();
+			// if the file was opened in non read mode, send the file to server
+			// only if write succeeded
+			// and delete the private copy created.
+			// The master copy is not marked as MRU because we created a new
+			// file to do the write operations.
+			// According to our cache, the master copy was not used at all.
+			if (file.getFileMode().compareTo("READ") != 0) {
+				if (!file.isErr())
+					sendFileToServer(fileName); // TODO check this method
+				
+				File f = new File(createPathName(dir, fileName));
+				long size = f.length();
+				boolean deleted = f.delete();
+				// boolean isDeleted = f.delete();
+				cacheMgr.setUsedSpace(-1 * size);
+				System.err.format(
+						"Proxy: %s (thread %d): File (%s) deleted %s\n",
+						PROXY_ID.toString(), Thread.currentThread().getId(),
+						file.getFilePath(), deleted);
+			} else {
+				// This is the master copy. Mark it as MRU.
+				// This needs to be an atomic operation and should be done one
+				// client at a time.
+				synchronized (lock) {
+					cacheMgr.printLRU();
+					// If the file is there in the usage list, remove it.
+					if (cacheMgr.isFileInLRU(file)) {
+						System.err
+								.format("Proxy: %s (thread %d): File %s removing from LRU\n",
+										PROXY_ID.toString(), Thread
+												.currentThread().getId(), file
+												.getFilePath());
+						cacheMgr.removeFileFromLRU(file);
+					}
+
+					// Add the file to the tail of the usage list. This would
+					// mark it as MRU
+					System.err.format(
+							"Proxy: %s (thread %d): File %s mark as MRU\n",
+							PROXY_ID.toString(),
+							Thread.currentThread().getId(), file.getFilePath());
+					cacheMgr.markFileAsMRU(file);
+					cacheMgr.printLRU();
+					// Close the opened file channel
+					// Remove entries from the map
+				}
+			}
+			try {
+				RandomAccessFile rf = fileFdMap.get(fd);
+				rf.close();
+				fileFdMap.remove(fd);
+				fileCacheFdMap.remove(fd);
+				cacheMgr.removeFileInUse(fileName);
+			} catch (IOException e1) {
+				// TODO Auto-generated catch block
+				e1.printStackTrace();
+			}
+			return 0;
+		}
+
+		public long write(int fd, byte[] buf) {
+			System.err.format("Proxy: %s (thread %d): In Write (Fd: %d).\n",
+					PROXY_ID.toString(), Thread.currentThread().getId(), fd);
+			long bytesWritten = -1;
+
+			if (fdDir.contains(fd)) {
+				System.err
+						.format("Proxy: %s (thread %d): In Write (Fd: %d). is a directory\n",
+								PROXY_ID.toString(), Thread.currentThread()
+										.getId(), fd);
+				return Errors.EISDIR;
+			}
+
+			if (!fileFdMap.containsKey(fd)) {
+				System.err
+						.format("Proxy: %s (thread %d): In Write (Fd: %d). does not contain FD\n",
+								PROXY_ID.toString(), Thread.currentThread()
+										.getId(), fd);
+				return Errors.EBADF;
+			}
+			content = ByteBuffer.wrap(buf);
+			RandomAccessFile rf = fileFdMap.get(fd);
+
+			try {
+				// TODO check cache space before writing
+				synchronized (lock) {
+					FileCache file = fileCacheFdMap.get(fd);
+					boolean hasSpace = cacheMgr.checkAndMakeSpace(buf.length,
+							privateHasMasterCopyMap.get(file.getFilePath()),
+							file.getFilePath(), true);
+					if (!hasSpace) {
+						System.err
+								.format("Proxy: %s (thread %d): In Write (Fd: %d). No space in cache to do additional write\n",
+										PROXY_ID.toString(), Thread.currentThread()
+												.getId(), fd);
+						file.setErr(true);
+						return 0;
+					}
+					bytesWritten = rf.getChannel().write(content);
+					fileFdMap.replace(fd, rf);	
+				}
+				
+				//cacheMgr.setUsedSpace(buf.length);
+			} catch (IOException e) {
+				// TODO Auto-generated catch block
+			} catch (NonWritableChannelException e) {
+				// return here the value
+				System.err.println("File not opened for writing");
+				return Errors.EBADF;
+			}
+			return bytesWritten;
+		}
+
+		public long read(int fd, byte[] buf) {
+			System.err.format("Proxy: %s (thread %d): In Read (Fd: %d, mode: %s).\n",
+					PROXY_ID.toString(), Thread.currentThread().getId(), fd,
+					fileCacheFdMap.get(fd).getFileMode());
+			long bytesRead = -1;
+
+			if (fdDir.contains(fd)) {
+				System.out.println("Fd is directory");
+				return Errors.EISDIR;
+			}
+
+			if (!fileFdMap.containsKey(fd)) {
+				System.out.println("Does not contain Fd");
+				return Errors.EBADF;
+			}
+			content = ByteBuffer.allocate(buf.length);
+
+			RandomAccessFile rf = fileFdMap.get(fd);
+
+			try {
+				bytesRead = rf.getFilePointer() == rf.length() ? 0 : rf
+						.read(buf);
+				fileFdMap.replace(fd, rf);
+			} catch (IOException e) {
+				// TODO Auto-generated catch block
+			}
+			return bytesRead;
+		}
+
+		public long lseek(int fd, long pos, LseekOption o) {
+			/*
+			 * Advances the file pointer by the pos given. To note that pos is a
+			 * signed value whereas file seek only accepts non-negative values.
+			 * Appropriate conversion needs to be done.
+			 */
+			System.err
+					.format("Proxy: %s (thread %d): In Lseek (Fd: %d, Pos: %d, Option: %s).\n",
+							PROXY_ID.toString(),
+							Thread.currentThread().getId(), fd, pos,
+							o.toString());
+
+			if (fdDir.contains(fd)) {
+				System.out.println("Fd is directory");
+				return Errors.EISDIR;
+			}
+
+			if (!fileFdMap.containsKey(fd)) {
+				System.out.println("Does not contain Fd");
+				return Errors.EBADF;
+			}
+
+			RandomAccessFile file = fileFdMap.get(fd);
+			long desired_pos = 0;
+			try {
+				switch (o.toString()) {
+				case "FROM_CURRENT":
+					// Calculate the desired position,
+					desired_pos = file.getFilePointer() + pos;
+					if (desired_pos < 0) {
+						System.out.println("Negative offset");
+						return Errors.EINVAL;
+					} else {
+						file.seek(0);
+						file.seek(desired_pos);
+						fileFdMap.replace(fd, file);
+					}
+					break;
+
+				case "FROM_END":
+					desired_pos = file.length() + pos;
+					if (desired_pos < 0) {
+						System.out.println("Negative offset");
+						return Errors.EINVAL;
+					} else {
+						file.seek(0);
+						file.seek(desired_pos);
+						fileFdMap.replace(fd, file);
+					}
+					break;
+
+				case "FROM_START":
+					desired_pos = pos;
+					if (desired_pos < 0) {
+						System.out.println("Negative offset");
+						return Errors.EINVAL;
+					} else {
+						file.seek(0);
+						file.seek(desired_pos);
+						fileFdMap.replace(fd, file);
+					}
+
+					break;
+
+				default:
+					return Errors.EINVAL;
+				}
+				return file.getFilePointer();
+			} catch (IOException e) {
+				// TODO Auto-generated catch block
+				// e.printStackTrace();
+				return Errors.EBADF;
+			}
+		}
+
+		public int unlink(String path) {
+			System.err.format("Proxy: %s (thread %d): In Unlink (%s).\n",
+					PROXY_ID.toString(), Thread.currentThread().getId(), path);
+			File f = new File(path);
+			if (f.isDirectory()) {
+				System.out.println("Is a directory");
+				// return Errors.EISDIR;
+			}
+
+			try {
+				svr.unlink(path);
+			} catch (RemoteException e) {
+				System.err.println("Error connecting to server");
+				return Errors.ENOENT;
+			}
+			return 0;
+			// return Errors.ENOSYS;
+		}
+
+		public void clientdone() {
+			System.err.format("Proxy: %s (thread %d): In ClientDone.\n",
+					PROXY_ID.toString(), Thread.currentThread().getId());
+			// check if file has been closed or not.
+			return;
+		}
+
+		private String createNewName(String path, String mode) {
+			int i = path.contains(".") ? path.lastIndexOf(".") : path.length();
+			return path.substring(0, i) + Thread.currentThread().getId() + "_"+mode
+					+ path.substring(i);
+		}
+
+		private int setMaps(int fd, FileCache file, RandomAccessFile rf) {
+			fileFdMap.put(fd, rf);
+			fileCacheFdMap.put(fd, file);
+			cacheMgr.addFileInUse(file.getFilePath(), file);
+			return fd;
+		}
+
+		private String createPathName(String dir, String path) {
+			/*
+			 * creates file pathname and return. if absolute file name is given
+			 * (/foo/filename), append as such to dir else add '/' before
+			 * appending
+			 */
+			return path.startsWith("/") ? dir + path : dir + '/' + path;
+		}
+
+		private String createSessionId(String path) {
+			return PROXY_ID + ":" + Thread.currentThread().getId() + ":" + path;
+		}
+
+		/**
+		 * @param path
+		 *            : file name which is to be sent to the server
+		 * 
+		 *            sends the file to the server in chunks
+		 */
+		private void sendFileToServer(String path) {
+			System.err.format(
+					"Proxy: %s (thread %d): Sending file (%s) to server.\n",
+					PROXY_ID.toString(), Thread.currentThread().getId(), path);
+			try {
+				File file = new File(createPathName(dir, path));
+				long size = file.length();
+				int no_of_blocks = 0;
+				System.err.format(
+						"Proxy: %s (thread %d): File (%s) size %d.\n",
+						PROXY_ID.toString(), Thread.currentThread().getId(),
+						path, size);
+				// initialize a map to store the block against its size
+				ConcurrentHashMap<Integer, Integer> blockSize = new ConcurrentHashMap<Integer, Integer>();
+				if (size > MAX_BLOCK_SIZE) {
+					while (size > 0) {
+						no_of_blocks++;
+						if (size > MAX_BLOCK_SIZE) {
+							size -= MAX_BLOCK_SIZE;
+							blockSize.put(no_of_blocks, MAX_BLOCK_SIZE);
+						} else {
+							blockSize.put(no_of_blocks, (int) size);
+							size = 0;
+						}
+					}
+				} else {
+					no_of_blocks = 1;
+					blockSize.put(no_of_blocks, (int) size);
+				}
+
+				// Get the name of the original master file
+				String origFile = privateHasMasterCopyMap.get(path);
+				int skipBytes = 0;
+				synchronized (lock) {
+					System.err
+							.format("Proxy (thread %d): Opening session for file (%s).\n",
+									Thread.currentThread().getId(), origFile);
+					// Open a session for write on the server. The file name on
+					// the server would be the one the client requested
+					// initially.
+					svr.openSessionForWrite(origFile);
+					// send file
+					for (int i = 1; i <= no_of_blocks; i++) {
+						if (i != 1)
+							skipBytes += blockSize.get(i - 1);
+						FileInputStream fIn = new FileInputStream(
+								createPathName(dir, path));
+						fIn.skip(skipBytes);
+						byte[] bytes = new byte[blockSize.get(i)];
+						fIn.read(bytes);
+						fIn.close();
+						svr.writeFile(bytes, origFile);
+					}
+					System.err
+							.format("Proxy (thread %d): Closing session for file (%s).\n",
+									Thread.currentThread().getId(), origFile);
+					// close the session for write on the server.
+					svr.closeSessionForWrite(origFile);
+				}
+
+			} catch (FileNotFoundException e) {
+				// TODO Return -1 in the form of byteArray
+				// e.printStackTrace();
+			} catch (IOException e) {
+				e.printStackTrace();
+			}
+		}
+
+	}
+
+	private static class FileHandlingFactory implements FileHandlingMaking {
+		public FileHandling newclient() {
+			return new FileHandler();
+		}
+	}
+
+	public static void main(String[] args) throws IOException {
+		// TODO is return required and would autolab check it?
+		int err = 0;
+		err = check_args(args);
+		if (err < 0) {
+			System.err.println("Invalid arguments ");
+			System.exit(1);
+		}
+		setProxyId();
+		// if (System.getSecurityManager() == null)
+		// System.setSecurityManager(new RMISecurityManager());
+		connect_to_server(args[0], args[1]);
+
+		(new RPCreceiver(new FileHandlingFactory())).run();
+		// Thread t = new Thread((new RPCreceiver(new FileHandlingFactory())));
+		// t.start();
+	}
+
+	public static int check_args(String[] args) {
+		int err = 0;
+		// Check arguments length
+		if (args.length < 4) {
+			// TODO find way to return Errors.EINVAL
+			System.err.println("A total of 4 arguments are required");
+			System.exit(1);
+		}
+
+		// TODO Check IP format
+
+		// Check port number
+		try {
+			@SuppressWarnings("unused")
+			int port = Integer.parseInt(args[1]);
+		} catch (NumberFormatException e) {
+			System.err.println("Not a valid port number " + e);
+			System.exit(1);
+		}
+
+		// Set cache directory.
+		err = cacheMgr.setCacheDir(args[2]);
+		if (err < 0)
+			System.exit(1);
+		Proxy.dir = cacheMgr.getCacheDir();
+
+		// Set cache size
+		try {
+			cacheMgr.setCacheSize(Long.parseLong(args[3]));
+		} catch (NumberFormatException e) {
+			// TODO find way to return Errors.EINVAL
+			System.err.println("Invalid Cache size ");
+			System.exit(1);
+		}
+		return err;
+	}
+
+	public static void connect_to_server(String ip, String port) {
+		// TODO Auto-generated method stub
+
+		try {
+			svr = (RmiInterface) Naming.lookup(String.format(
+					"//%s:%s/ServerService", ip, port));
+		} catch (RemoteException e) {
+			System.err.println("Failed to connect to Server " + e);
+			System.exit(1);
+		} catch (NotBoundException e) {
+			System.err.println("Not Bound " + e);
+			System.exit(1);
+		} catch (MalformedURLException e) {
+			System.err.println("Invalid URL " + e);
+			System.exit(1);
+		}
+
+		if (svr == null) {
+			System.err.println("server is null");
+			System.exit(1);
+		}
+	}
+
+	/**
+	 * @return the dir
+	 */
+	public static String getDir() {
+		return dir;
+	}
+
+	/**
+	 * @return the dir_size
+	 */
+	public static long getDir_size() {
+		return dir_size;
+	}
+
+	public static void setProxyId() {
+		PROXY_ID = UUID.randomUUID();
+	}
+}

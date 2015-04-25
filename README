@@ -1,0 +1,12 @@
+This project implements a disk-based cache. The client library was provided as 
+part of the project. A caching proxy and the server has been written to complete
+the project. The client connects to the proxy and the proxy connects to the server.
+
+The proxy will handle the RPC file operations from the client interposition library. 
+It will fetch whole files from the server, and cache them locally. The protocol used
+between the proxy and the server, and cache management has been self-defined. 
+The protocol is not implemented at the level of individual file operations. Rather, 
+it operates at a higher level on whole files and cover cache management operations.
+
+See handout.pdf for additional details.
+A brief design document is given in the src folder

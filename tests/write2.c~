@@ -1,0 +1,18 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+void main(){
+	char *buf = "slow write";
+	printf("Client 7 starts");
+	int i, fd;
+	fd = open("file8", O_RDWR);
+	
+	printf("Slow write of file 8");
+	write(fd, buf, 10);
+	close(fd);
+	printf("Client 7 ends");
+}

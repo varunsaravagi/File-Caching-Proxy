@@ -1,0 +1,17 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
+void main(){
+	char buf[1000];
+	printf("Client 2 starts");
+	int fd,i;
+	fd = open("file1", read);
+	for(i = 0; i<5; i++){
+		printf("Client 2 reads");
+		read(fd, buf, 1000);
+		sleep(10);
+	}
+	close(fd);
+	printf("Client 2 ends");
+}

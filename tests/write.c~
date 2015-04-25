@@ -1,0 +1,48 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <err.h>
+#include <errno.h>
+
+int main(int argc, char**argv) {
+	int fd1, fd2, i; 
+	ssize_t rv, wv;
+	char buf[1000000];
+	struct stat st;
+
+	//if (argc<2) {
+	//	printf("need to specify file\n");
+	//	exit(1);
+	//}
+
+	//if (argc < 2) {
+	//	printf("need to specify string to write\n");
+	//	exit(1);
+	//}
+	
+	//if (__xstat(1, argv[1], &st) < 0 ) {
+	//	printf("Couldn't stat %s\n", argv[1]);
+	//	exit(1);
+	//}
+	//printf("file is %d bytes long\n", (int) st.st_size);
+	
+	//printf("Test 1: Write to read only\n");
+	fd1 = open(argv[1], O_RDONLY);
+	fd2 = open(argv[2], O_RDWR);
+	printf("Fd1 %d, Fd2 %d", fd1, fd2);
+	for (i=0;i<20;i++){
+		
+		rv = read(fd1, buf, 1000000);
+		printf("Read %zd\n", rv);
+		wv = write(fd2, buf, 1000000);
+		printf("Written %zd\n", wv);
+	}
+	//}
+	close(fd1);
+	close(fd2);
+
+	return 0;
+}

@@ -1,0 +1,21 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+void main(){
+	char buf[1000];
+	printf("Client 1 starts");
+	int fd;
+	fd = open("file1", 0_RDONLY);
+	int i;
+	for(i = 0; i<5; i++){
+		printf("Client 1 reads");
+		read(fd, buf, 1000);
+		sleep(10);
+	}
+	close(fd);
+	printf("Client 1 ends");
+}

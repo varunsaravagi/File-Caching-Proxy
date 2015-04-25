@@ -1,0 +1,90 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+void main(){
+	char buf[1000];
+
+	printf("Client 5 starts\n");
+	int i, fd;
+	fd = open("file1", O_RDONLY);
+	for(i = 0; i<5; i++){
+		printf("Client 5 reads\n");
+		read(fd, buf, 1000);
+	}
+	close(fd);
+	printf("Client 5 ends\n");
+
+	printf("Client 6 starts\n");
+	int i, fd;
+	fd = open("file2", O_RDONLY);
+	for(i = 0; i<5; i++){
+		printf("Client 6 reads\n");
+		read(fd, buf, 1000);
+	}
+	close(fd);
+	printf("Client 6 ends\n");
+
+	printf("Client 7 starts\n");
+	int i, fd;
+	fd = open("file3", O_RDONLY);
+	for(i = 0; i<5; i++){
+		printf("Client 7 reads\n");
+		read(fd, buf, 1000);
+	}
+	close(fd);
+	printf("Client 7 ends\n");
+	
+	printf("Client 8 starts\n");
+	int i, fd;
+	fd = open("file4", O_RDONLY);
+	for(i = 0; i<5; i++){
+		printf("Client 8 reads\n");
+		read(fd, buf, 1000);
+	}
+	close(fd);
+	printf("Client 8 ends\n");
+	
+	printf("Client 9 starts\n");
+	int i, fd;
+	fd = open("file5", O_RDONLY);
+	for(i = 0; i<5; i++){
+		printf("Client 9 reads\n");
+		read(fd, buf, 1000);
+	}
+	close(fd);
+	printf("Client 9 ends\n");	
+	
+	printf("Client 10 starts\n");
+	int i, fd;
+	fd = open("file6", O_RDONLY);
+	for(i = 0; i<5; i++){
+		printf("Client 10 reads");
+		read(fd, buf, 1000);
+	}
+	close(fd);
+	printf("Client 10 ends\n");	
+
+	printf("Client 11 starts\n");
+	int i, fd;
+	fd = open("file7", O_RDONLY);
+	for(i = 0; i<5; i++){
+		printf("Client 11 reads");
+		read(fd, buf, 1000);
+	}
+	close(fd);
+	printf("Client 11 ends\n");
+
+	printf("Client 12 starts\n");
+	int i, fd;
+	fd = open("file8", O_RDONLY);
+	for(i = 0; i<5; i++){
+		printf("Client 12 reads");
+		read(fd, buf, 1000);
+	}
+	close(fd);
+	printf("Client 12 ends\n");
+}

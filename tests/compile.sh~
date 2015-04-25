@@ -1,0 +1,16 @@
+#!/bin/bash
+
+gcc read1.c -o read1
+gcc read2.c -o read2
+gcc read3.c -o read3
+gcc read4.c -o read4
+gcc read5.c -o read5
+gcc read6.c -o read6
+gcc write1.c -o write1
+gcc write2.c -o write2
+gcc read9.c -o read9
+gcc read10.c -o read10
+gcc read11.c -o read11
+gcc read12.c -o read12
+
+
